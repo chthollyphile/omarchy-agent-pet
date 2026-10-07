@@ -14,7 +14,7 @@ The character, animations, and core pet behavior are ported from [dsh-pet](https
 
 - **Pet behavior**: idling, random actions, turning, walking, click reactions, and physics-based dragging and throwing.
 - **Work status**: six states (thinking, working, reviewing results, waiting, success, error) driven by Claude Code / Codex hooks. The bubble can show the project name, the current tool and command, and the agent's own step narration.
-- **Attention alerts**: a bubble when approval is needed, when a task completes, or when it fails, plus a desktop notification (agent name and status only) if the terminal that sent the event is not focused.
+- **Attention alerts**: a bubble when approval is needed, when a task completes, or when it fails, plus a desktop notification (project name and message when `python-gobject` / `gi` is available; otherwise fixed agent-name and status text) if the terminal that sent the event is not focused.
 - **Usage**: shows each rate-limit window's usage and reset countdown from Omarchy's `omarchy.agents` data.
 - **Murmurs and chat**: generated with `claude -p` or `codex exec`, only when you ask for them.
 - **English and Chinese UI**, chosen from the system locale.
@@ -23,7 +23,8 @@ The character, animations, and core pet behavior are ported from [dsh-pet](https
 
 - Omarchy 4
 - The `qt6-imageformats` package, which provides WebP decoding for Qt. Restart the shell with `omarchy-restart-shell` after installing it.
-- `jq` and `notify-send` (both present on a default Omarchy install)
+- `jq`, `socat`, `notify-send`
+- Optional: `python-gobject` (PyGObject / `gi`) for D-Bus notifications with project names and messages; without it, notifications fall back to fixed text.
 - Claude Code and/or the Codex CLI for work-status integration
 
 ## Installation
@@ -60,6 +61,8 @@ omarchy-shell agent-pet toggle          # hide / show
 
 Built-in defaults live in `assets/config.json`. Put your settings in `~/.config/agent-pet/config.jsonc` (comments allowed); changes apply as soon as the file is saved. Each top-level field in your file replaces the default as a whole. See the [configuration reference](https://github.com/chthollyphile/agent-pet#configuration) for every field.
 
+An empty `llm.codexModel` / `autoModel.codexModel` uses Codex’s built-in default model; the user’s `config.toml` is not loaded.
+
 ```jsonc
 {
   "language": "auto",                                // auto, zh, or en
@@ -73,7 +76,10 @@ Built-in defaults live in `assets/config.json`. Put your settings in `~/.config/
 
 ```bash
 omarchy plugin update chthollyphile.agent-pet
+omarchy restart shell
 ```
+
+The hook and pet live in the same plugin directory and update together. Restarting the shell loads the new QML components.
 
 ## Uninstallation
 
@@ -92,16 +98,26 @@ rm -rf ~/.config/agent-pet ~/.local/state/agent-pet ~/.cache/agent-pet
 
 The `.bak-agent-pet-*` backups next to `~/.claude/settings.json` and `~/.codex/hooks.json` are kept; delete them if you no longer need them.
 
+## Runtime files
+
+| Path | Description |
+|---|---|
+| `Service.qml` | Configuration, session state, notifications, and IPC |
+| `EventServer.qml` | Unix socket server for hook events |
+| `bin/agent-pet-hook` | Forwards hook events through `socat` |
+| `bin/agent-pet-notify` | Reads notifications from stdin, sends them over D-Bus, and escapes body markup |
+
 ## Privacy and permissions
 
 The plugin runs unsandboxed inside the Omarchy shell with your user permissions.
 
 - **Files written**: `~/.local/state/agent-pet/` and, only when you run the hook installer, `~/.claude/settings.json` and `~/.codex/hooks.json`. It never writes your `config.jsonc`.
-- **Network access**: none by default. Usage data comes from Omarchy's own `omarchy.agents` collector; only `"usage": {"source": "builtin"}` makes the plugin query Claude / Codex rate limits itself.
+- **Network access**: none by default. Usage data comes from Omarchy's own `omarchy.agents` collector; only `"usage": {"source": "builtin"}` makes the plugin query Claude / Codex rate limits itself. Enabling or manually triggering model features also makes the relevant CLI contact its model provider.
 - **Model calls** happen only for the **Murmur** and **Chat** menu actions, the `whisper` and `chat` IPC methods, and the opt-in `whisperAuto` and `stepSummary.mode = "model"` settings. They run your own `claude` or `codex` CLI.
-- **Data forwarded by hooks** is limited to the event name, session ID, project path, tool name, the first line of the tool arguments (up to 120 characters), notification text (up to 200), the first 300 characters of the turn's prompt, the final reply when a turn ends (up to 2000), and the transcript path. It never leaves your machine.
+- **Data forwarded by hooks** is limited to the event name, session ID, project path, tool name, the first line of the tool arguments (up to 120 characters), notification text (up to 200), the first 300 characters of the turn's prompt, the final reply when a turn ends (up to 2000), and the transcript path. Hook transport stays on your machine; model step summaries send some of this content to a model provider (see below).
 - **Session transcripts** are read only when `stepSummary.mode = "transcript"`, and only the last 400 KB each time.
-- **Process arguments carry no private content**, because other local users can read every process's command line. Hook events are passed through a private file in `$XDG_RUNTIME_DIR/agent-pet/` (directory mode 700, deleted right after the pet reads it), prompts and chat history reach `claude` / `codex` on standard input with the system prompt in a private file, and desktop notifications contain only the agent name and status. Text you pass yourself to `omarchy-shell agent-pet say` or `chat` is part of that command's line.
+- **Model step summaries**: enabling `stepSummary.mode = "model"` sends the request excerpt (up to 300 characters) and summaries of the last 8 actions to the provider configured in `autoModel`. This may be a different provider from the one used by the current Claude Code / Codex session.
+- **Process arguments carry no private content**, because other local users can read process command lines. Hook events travel through a pipe and `$XDG_RUNTIME_DIR/agent-pet/events.sock` (parent directory mode 700); `socat` arguments contain only the socket path. Prompts and chat history reach `claude` / `codex` on standard input, with the system prompt in a private file. Notification project names and messages reach `bin/agent-pet-notify` on standard input and are sent over D-Bus; without `gi`, `notify-send` receives only fixed text. Text you pass yourself to `omarchy-shell agent-pet say` or `chat` is part of that command’s line.
 - **`~/.local/state/agent-pet/`** (chat history, prompt files) is kept at mode 700.
 
 ## Credits and license

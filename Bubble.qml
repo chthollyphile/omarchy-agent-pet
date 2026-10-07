@@ -56,6 +56,9 @@ Item {
       Text {
         id: label
         text: bubble.shownContent ? bubble.shownContent.text : ""
+        // 内容来自 agent 会话和模型输出，不可信：一律按纯文本显示。
+        // 默认的 AutoText 在首行像 HTML 时会按富文本解析，<img> 里的远程地址会被直接请求。
+        textFormat: Text.PlainText
         color: "#2b2b2b"
         font.family: bubble.resolvedFamily
         font.pixelSize: bubble.fontSize

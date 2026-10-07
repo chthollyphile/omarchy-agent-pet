@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""agent-pet-notify: send one desktop notification over D-Bus, read from stdin.
+
+notify-send can only take the text from its command line, which every local
+user can read. This script reads the notification as one JSON object on
+standard input and calls org.freedesktop.Notifications.Notify directly
+through PyGObject, so the project name and message never appear in process
+arguments:
+
+  {"app": "agent-pet", "icon": "/path/to/icon.png", "summary": "...", "body": "..."}
+
+Exit status: 0 sent; 1 the D-Bus call failed; 2 bad input; 3 PyGObject (gi)
+is not available, so the caller falls back to notify-send with fixed text.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+
+try:
+  import gi
+
+  gi.require_version("Gio", "2.0")
+  from gi.repository import Gio, GLib
+except (ImportError, ValueError):
+  sys.exit(3)
+
+BUS_NAME = "org.freedesktop.Notifications"
+OBJECT_PATH = "/org/freedesktop/Notifications"
+INTERFACE = "org.freedesktop.Notifications"
+
+
+def call(bus: Gio.DBusConnection, method: str, params: GLib.Variant | None, reply: str) -> tuple:
+  result = bus.call_sync(
+    BUS_NAME, OBJECT_PATH, INTERFACE, method, params, GLib.VariantType(reply), Gio.DBusCallFlags.NONE, 5000, None
+  )
+  return result.unpack()
+
+
+def main() -> int:
+  try:
+    data = json.load(sys.stdin)
+  except ValueError:
+    return 2
+  if not isinstance(data, dict):
+    return 2
+  app = str(data.get("app") or "agent-pet")
+  icon = str(data.get("icon") or "")
+  summary = str(data.get("summary") or "")
+  body = str(data.get("body") or "")
+
+  try:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    # The body carries agent messages, which are untrusted. Servers that
+    # support body markup parse it, so escape it for them.
+    (capabilities,) = call(bus, "GetCapabilities", None, "(as)")
+    if "body-markup" in capabilities:
+      body = GLib.markup_escape_text(body)
+    call(bus, "Notify", GLib.Variant("(susssasa{sv}i)", (app, 0, icon, summary, body, [], {}, -1)), "(u)")
+  except GLib.Error:
+    return 1
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
-# Claude Code / Codex hook 桥接：把 hook 事件转发给 omarchy-shell 里的 agent-pet 插件。
+# Claude Code / Codex hook 桥接：把 hook 事件转发给 agent-pet（Omarchy 插件或独立模式实例）。
 # 用法（hooks 配置里的 command）：agent-pet-hook claude | agent-pet-hook codex
 #
 # 约束：
 # - stdout 不输出任何内容（UserPromptSubmit / SessionStart 的 stdout 会被注入模型上下文）；
-# - 始终 exit 0，且立即返回：真正的 IPC 调用放到后台，不拖慢 agent。
+# - 始终 exit 0，且立即返回：发送放到后台，不拖慢 agent。
 # - AGENT_PET_INTERNAL=1 时直接退出：宠物自己调用 claude -p / codex exec 时不回灌事件。
 # - 事件内容（提问、工具参数、回复摘录）不放进任何命令行参数：进程参数对本机所有用户可见。
-#   内容写进只有本用户能读的临时文件，IPC 只传文件路径，宠物同步读完后这里删除。
+#   事件经管道交给 socat，写进宠物监听的 Unix socket；socat 的参数里只有 socket 路径。
 
 [[ ${AGENT_PET_INTERNAL:-} == 1 ]] && exit 0
 agent=${1:-claude}
 payload=$(cat)
 
+# 与 EventServer.qml 一致；宠物没在运行（没有 socket）或没装 socat 时什么都不做
+sock=${XDG_RUNTIME_DIR:-/run/user/$UID}/agent-pet/events.sock
+[[ -S $sock ]] && command -v socat >/dev/null || exit 0
+
 # 发事件的终端是否在前台：从本进程沿父进程链向上，看能否碰到 Hyprland 当前窗口的 pid
 focused=false
 active_pid=$(hyprctl activewindow -j 2>/dev/null | jq -r '.pid // empty' 2>/dev/null)
-if [[ -n $active_pid ]]; then
+if [[ $active_pid =~ ^[0-9]+$ ]]; then
   pid=$$
-  while [[ -n $pid && $pid -gt 1 ]]; do
+  while [[ $pid =~ ^[0-9]+$ ]] && (( pid > 1 )); do
     if [[ $pid == "$active_pid" ]]; then focused=true; break; fi
-    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+    # /proc/<pid>/stat 是 "pid (comm) state ppid ..."，comm 可能含空格和括号：从最后一个 ") " 之后取 ppid
+    { read -r stat < "/proc/$pid/stat"; } 2>/dev/null || break
+    read -r _ pid _ <<<"${stat##*) }"
   done
 fi
 
-# 只挑需要的字段：tool_input / tool_response 可能很大，不能整个塞进 IPC 参数
+# 只挑需要的字段：tool_input / tool_response 可能很大
 event=$(jq -c --arg agent "$agent" --argjson focused "$focused" '{
   agent: $agent,
   event: (.hook_event_name // ""),
@@ -46,20 +52,11 @@ event=$(jq -c --arg agent "$agent" --argjson focused "$focused" '{
   focused: $focused
 }' 2>/dev/null <<<"$payload") || exit 0
 
-# 与 Service.qml 的 eventDirs 一致
-if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then dir=$XDG_RUNTIME_DIR/agent-pet; else dir=$HOME/.local/state/agent-pet/events; fi
-umask 077
-mkdir -p "$dir" && chmod 700 "$dir" || exit 0
-file=$(mktemp --suffix=.json "$dir/event.XXXXXXXXXX") || exit 0
-printf '%s' "$event" > "$file" || { rm -f "$file"; exit 0; }
-
-# 先交给 Omarchy 里的 agent-pet 插件；没有 Omarchy 或插件没启用时，交给独立模式实例（qs -p <仓库目录>）
-root=$(cd "$(dirname "$0")/.." && pwd -P)
+# 一行 JSON。printf 是 bash 内建命令，事件不会出现在任何进程的参数里。
+# shut-none + 双向模式：发完不半关闭，等宠物读完一行后由宠物断开（-t 2 兜底），
+# 否则 Quickshell 会为每次"对端先断开"记一条警告日志。
 (
-  if ! { command -v omarchy-shell >/dev/null && omarchy-shell agent-pet eventFile "$file"; }; then
-    qs ipc -p "$root" call agent-pet eventFile "$file"
-  fi
-  rm -f "$file"
+  printf '%s\n' "$event" | socat -t 2 - "UNIX-CONNECT:$sock,shut-none"
 ) </dev/null >/dev/null 2>&1 &
 disown
 exit 0

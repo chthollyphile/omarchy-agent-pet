@@ -14,7 +14,7 @@ Agent Pet 是一个 Omarchy shell 插件（`chthollyphile.agent-pet`），在桌
 
 - **桌宠行为**：待机、随机动作、转向、行走、点击回应，以及带物理效果的拖拽与甩抛。
 - **工作状态联动**：通过 Claude Code / Codex 的 hooks 接收事件，在思考、工作、整理、等待、成功、出错 6 种状态之间切换。气泡可显示项目名、当前工具与命令摘要，以及 agent 自己写的步骤说明。
-- **等待提醒**：需要确认、任务完成或出错时显示气泡；发出事件的终端不在前台时，同时发送系统通知（只含 agent 名称和状态）。
+- **等待提醒**：需要确认、任务完成或出错时显示气泡；发出事件的终端不在前台时，同时发送系统通知（有 `python-gobject` / `gi` 时显示项目名和消息；没有时只显示 agent 名称和状态等固定文字）。
 - **用量显示**：使用 Omarchy `omarchy.agents` 的数据，列出每个额度窗口的用量和重置倒计时。
 - **碎碎念与对话**：通过 `claude -p` 或 `codex exec` 生成，只在你主动触发时调用。
 - **中英文界面**：根据系统语言自动选择。
@@ -23,7 +23,8 @@ Agent Pet 是一个 Omarchy shell 插件（`chthollyphile.agent-pet`），在桌
 
 - Omarchy 4
 - `qt6-imageformats` 软件包：Qt 的 WebP 解码插件。安装后运行 `omarchy-restart-shell` 重启 shell。
-- `jq`、`notify-send`（Omarchy 默认已安装）
+- `jq`、`socat`、`notify-send`
+- 可选：`python-gobject`（PyGObject / `gi`），用于包含项目名和消息的 D-Bus 通知；缺少时退回固定文字通知。
 - 需要工作状态联动时：Claude Code 和/或 Codex CLI
 
 ## 安装
@@ -60,6 +61,8 @@ omarchy-shell agent-pet toggle          # 隐藏 / 显示
 
 内置默认值在 `assets/config.json`。个人设置写在 `~/.config/agent-pet/config.jsonc`（允许注释），保存后立即生效。文件里的每个顶层字段会整体替换默认值。全部字段见主仓库的[配置说明](https://github.com/chthollyphile/agent-pet/blob/main/README.zh-CN.md#配置)。
 
+`llm.codexModel` / `autoModel.codexModel` 留空时使用 Codex 内置默认模型，不读取用户的 `config.toml`。
+
 ```jsonc
 {
   "language": "auto",                                // auto、zh 或 en
@@ -73,7 +76,10 @@ omarchy-shell agent-pet toggle          # 隐藏 / 显示
 
 ```bash
 omarchy plugin update chthollyphile.agent-pet
+omarchy restart shell
 ```
+
+hook 和宠物位于同一个插件目录，会一起更新；重启 shell 后加载新的 QML 组件。
 
 ## 卸载
 
@@ -92,16 +98,26 @@ rm -rf ~/.config/agent-pet ~/.local/state/agent-pet ~/.cache/agent-pet
 
 `~/.claude/settings.json` 和 `~/.codex/hooks.json` 旁边的 `.bak-agent-pet-*` 备份会保留，不需要时可以手动删除。
 
+## 运行文件
+
+| 路径 | 说明 |
+|---|---|
+| `Service.qml` | 配置、会话状态、通知与 IPC |
+| `EventServer.qml` | 接收 hook 事件的 Unix socket 服务 |
+| `bin/agent-pet-hook` | 经 `socat` 转发 hook 事件 |
+| `bin/agent-pet-notify` | 从标准输入读取通知，经 D-Bus 发送并转义正文 markup |
+
 ## 隐私与权限
 
 插件在 Omarchy shell 进程内以当前用户权限运行，没有沙箱。
 
 - **写入的文件**：`~/.local/state/agent-pet/`，以及仅在你运行 hook 安装脚本时修改的 `~/.claude/settings.json` 和 `~/.codex/hooks.json`。不会写入你的 `config.jsonc`。
-- **网络访问**：默认没有。用量数据来自 Omarchy 自带的 `omarchy.agents` 采集；只有设置 `"usage": {"source": "builtin"}` 时，插件才会自己查询 Claude / Codex 的额度。
+- **网络访问**：默认没有。用量数据来自 Omarchy 自带的 `omarchy.agents` 采集；只有设置 `"usage": {"source": "builtin"}` 时，插件才会自己查询 Claude / Codex 的额度。启用或手动触发模型功能时，相应 CLI 也会联系模型提供方。
 - **模型调用**只发生在菜单的**碎碎念**、**对话**，IPC 的 `whisper`、`chat`，以及需要手动开启的 `whisperAuto` 和 `stepSummary.mode = "model"`。调用的是你本机的 `claude` 或 `codex` CLI。
-- **hooks 转发的数据**仅限：事件名、会话 ID、项目路径、工具名、工具参数首行（最多 120 字符）、通知文本（最多 200 字符）、本轮提问前 300 字符、回合结束时的最终回复（最多 2000 字符）和 transcript 路径。数据不会离开本机。
+- **hooks 转发的数据**仅限：事件名、会话 ID、项目路径、工具名、工具参数首行（最多 120 字符）、通知文本（最多 200 字符）、本轮提问前 300 字符、回合结束时的最终回复（最多 2000 字符）和 transcript 路径。hook 传输本身仅限本机；启用模型步骤总结后，部分内容会发给模型提供方（见下文）。
 - **会话 transcript** 只在 `stepSummary.mode = "transcript"` 时读取，每次只读最后 400 KB。
-- **进程参数里不放私密内容**：本机其他用户能看到所有进程的命令行。hook 事件经 `$XDG_RUNTIME_DIR/agent-pet/` 下的私有文件传递（目录权限 700，宠物读完立即删除）；提示词和对话历史通过标准输入交给 `claude` / `codex`，系统提示词写在私有文件里；系统通知只包含 agent 名称和状态。你自己通过 `omarchy-shell agent-pet say` 或 `chat` 传入的文字会出现在该命令的命令行里。
+- **模型步骤总结**：启用 `stepSummary.mode = "model"` 后，本轮请求摘录（最多 300 字符）和最近 8 步操作摘要会发送给 `autoModel` 配置的提供方。该提供方可能不是当前 Claude Code / Codex 会话使用的那家。
+- **进程参数里不放私密内容**：本机其他用户能看到进程的命令行。hook 事件经管道和 `$XDG_RUNTIME_DIR/agent-pet/events.sock` 传递（父目录权限 700），`socat` 参数只含 socket 路径；提示词和对话历史通过标准输入交给 `claude` / `codex`，系统提示词写在私有文件里。通知的项目名和消息通过标准输入交给 `bin/agent-pet-notify`，再经 D-Bus 发送；没有 `gi` 时退回 `notify-send`，只传固定文字。你自己通过 `omarchy-shell agent-pet say` 或 `chat` 传入的文字会出现在该命令的命令行里。
 - **`~/.local/state/agent-pet/`**（对话记录、提示词文件）权限保持为 700。
 
 ## 致谢与许可证

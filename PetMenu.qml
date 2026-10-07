@@ -142,6 +142,7 @@ Item {
                 anchors.right: arrow.left
                 anchors.verticalCenter: parent.verticalCenter
                 text: row.modelData.label
+                textFormat: Text.PlainText
                 elide: Text.ElideRight
                 color: row.selected ? Color.menu.selectedText : Color.menu.text
                 font.family: Style.fontFamily

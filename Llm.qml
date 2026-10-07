@@ -33,8 +33,22 @@ Scope {
     if (proc.running) return false
     var cmd
     if (provider === "codex") {
+      // 只要一段文字，和 claude 一样不给工具。-s read-only 只限制 shell 命令，管不到连接器、插件和联网搜索，
+      // 而 ChatGPT 账号绑定的连接器（Gmail、Drive、GitHub 等）不在 config.toml 里，--ignore-user-config 也去不掉，
+      // 所以逐项关闭。剩下的 apply_patch（部分模型内置）由 read-only + approval_policy=never 挡住写入。
+      // 功能名对应 codex-cli 0.147 的 `codex features list`；未知名字会让 codex 报错退出。
       // 不给 PROMPT 参数时 codex exec 从 stdin 读指令
-      cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "--color", "never"]
+      cmd = ["codex", "exec",
+        "--ignore-user-config", "--ignore-rules",
+        "--skip-git-repo-check", "--ephemeral",
+        "-s", "read-only", "-c", "approval_policy=\"never\"",
+        "--disable", "unified_exec", "--disable", "shell_tool",
+        "--disable", "apps", "--disable", "plugins", "--disable", "tool_suggest",
+        "--disable", "multi_agent", "--disable", "view_image",
+        "--disable", "browser_use", "--disable", "computer_use", "--disable", "image_generation",
+        "--disable", "hooks",
+        "-c", "web_search=\"disabled\"",
+        "--color", "never"]
       if (model) cmd.push("-m", model)
       if (cheap) cmd.push("-c", "model_reasoning_effort=\"low\"")
       proc.input = systemPrompt + "\n\n" + prompt

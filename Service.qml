@@ -20,9 +20,8 @@ Scope {
   readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, ""))
   readonly property string userConfigPath: home + "/.config/agent-pet/config.jsonc"
   readonly property string stateDir: home + "/.local/state/agent-pet"
-  // hook 事件的临时文件目录，与 bin/agent-pet-hook 一致
-  readonly property string eventDir: Quickshell.env("XDG_RUNTIME_DIR")
-    ? Quickshell.env("XDG_RUNTIME_DIR") + "/agent-pet" : stateDir + "/events"
+  // hook 事件 socket 所在目录（0700），与 bin/agent-pet-hook 一致
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") + "/agent-pet"
 
   // ------------------------------------------------------------ 配置
   property var config: ({})
@@ -128,25 +127,11 @@ Scope {
     return a[agent] !== false
   }
 
-  // hook 把事件写进 eventDir 下只有本用户可读的文件，IPC 只传路径（事件内容不进进程参数）。
-  // 这里同步读完，hook 在 IPC 返回后删除文件。
-  FileView {
-    id: eventFileView
-    blockLoading: true
-    printErrors: false
-  }
-
-  function handleEventFile(path) {
-    var p = String(path || "")
-    if (p.indexOf(eventDir + "/") !== 0 || !/^event\.[A-Za-z0-9]+\.json$/.test(p.slice(eventDir.length + 1)))
-      return "bad-path"
-    eventFileView.path = p
-    eventFileView.reload()
-    eventFileView.waitForJob()
-    if (!eventFileView.loaded) return "unreadable"
-    var json = eventFileView.text()
-    eventFileView.path = ""
-    return handleEvent(json)
+  // hook 经 socat 把事件写进 runtimeDir/events.sock，每行一个 JSON（事件内容不进进程参数）
+  EventServer {
+    id: eventServer
+    path: root.runtimeDir + "/events.sock"
+    onReceived: line => root.handleEvent(line)
   }
 
   function handleEvent(json) {
@@ -201,6 +186,10 @@ Scope {
   // ------------------------------------------------------------ 系统通知
   readonly property var notifyTitleKeys: ({ waiting: "notifyWaiting", success: "notifySuccess", error: "notifyError" })
   readonly property var notifyIcons: ({ waiting: "approval", success: "done", error: "error" })
+  // 完整通知（含项目名和消息）经 stdin 交给 bin/agent-pet-notify，由它直接走 D-Bus，不进进程参数。
+  // 没有 PyGObject（gi）时退回 notify-send：它只能从命令行参数拿文本，所以只发固定文字。
+  property bool notifyViaDbus: true
+  property var notifyQueue: []
 
   function notifyFor(entry) {
     if (config.notificationsEnabled === false) return
@@ -210,13 +199,61 @@ Scope {
     var onlyUnfocused = !config.notify || config.notify.onlyWhenUnfocused !== false
     if (onlyUnfocused && entry.focused) return
     var agentName = entry.agent === "codex" ? "Codex" : "Claude Code"
-    // notify-send 只能从命令行参数拿文本，而进程参数对本机所有用户可见：
-    // 通知里只放固定文字，项目名、消息和工具等内容只显示在宠物气泡里
-    Quickshell.execDetached([
-      "notify-send", "-a", "agent-pet",
-      "-i", root.pluginDir + "/assets/pic/notify-" + notifyIcons[entry.state] + ".png",
-      agentName + " · " + title
-    ])
+    var project = WS.projectName(entry.cwd)
+    var n = {
+      app: "agent-pet",
+      icon: root.pluginDir + "/assets/pic/notify-" + notifyIcons[entry.state] + ".png",
+      summary: agentName + (project ? " · " + project : "") + " · " + title,
+      body: entry.message || entry.tool || "",
+      fixedSummary: agentName + " · " + title
+    }
+    if (!notifyViaDbus) {
+      notifyFixed(n)
+      return
+    }
+    notifyQueue = notifyQueue.concat([n])
+    nextNotify()
+  }
+
+  function notifyFixed(n) {
+    Quickshell.execDetached(["notify-send", "-a", n.app, "-i", n.icon, n.fixedSummary])
+  }
+
+  function nextNotify() {
+    while (notifyQueue.length && !notifyProc.running) {
+      var n = notifyQueue[0]
+      notifyQueue = notifyQueue.slice(1)
+      if (!notifyViaDbus) {
+        notifyFixed(n)
+        continue
+      }
+      notifyProc.current = n
+      notifyProc.lastExit = -1
+      notifyProc.stdinEnabled = true
+      notifyProc.running = true
+    }
+  }
+
+  Process {
+    id: notifyProc
+    property var current: null
+    property int lastExit: -1
+    command: [root.pluginDir + "/bin/agent-pet-notify"]
+    onStarted: {
+      write(JSON.stringify(current))
+      stdinEnabled = false
+    }
+    onExited: function(exitCode) {
+      lastExit = exitCode
+    }
+    // 启动失败时只有 runningChanged、没有 exited，所以在这里收尾。
+    // 3 = 没有 gi，-1 = 脚本没能启动：之后都直接发固定文字
+    onRunningChanged: {
+      if (running) return
+      if (lastExit === 3 || lastExit === -1) root.notifyViaDbus = false
+      if (lastExit !== 0) root.notifyFixed(current)
+      root.nextNotify()
+    }
   }
 
   // ------------------------------------------------------------ 用量
@@ -396,7 +433,7 @@ Scope {
         return
       }
       if (kind === "chat") root.rememberChat(petId, llm.lastUserText, text)
-      root.speak(petId, text, meme, kind)
+      root.speak(petId, text, root.knownMeme(meme), kind)
     }
   }
 
@@ -521,6 +558,12 @@ Scope {
     return Object.keys(config.memes || {})
   }
 
+  // 对话回复里的表情包名由模型给出，而名字会拼进图片路径：只认配置里有的
+  function knownMeme(name) {
+    var memes = config.memes || {}
+    return name && Object.prototype.hasOwnProperty.call(memes, name) ? name : ""
+  }
+
   function persona(pet) {
     return (config.whisperPrompt || "") + (lang === "en" ? " " : "") + tr("personaName", { name: pet.name || pet.id })
   }
@@ -622,16 +665,20 @@ Scope {
     }
   }
 
-  // 对话记忆和模型提示词文件只给本用户读
-  Component.onCompleted: Quickshell.execDetached(["bash", "-c", 'mkdir -p -m 700 "$0" && chmod 700 "$0"', root.stateDir])
+  // 对话记忆、模型提示词文件和事件 socket 只给本用户访问；目录建好后再开始监听
+  Process {
+    running: true
+    command: ["bash", "-c", 'mkdir -p -m 700 "$@"; chmod 700 "$@"', "_", root.stateDir, root.runtimeDir]
+    onExited: function(exitCode) {
+      if (exitCode === 0) eventServer.start()
+      else console.warn("[agent-pet] 无法创建 " + root.runtimeDir + "，收不到 hook 事件")
+    }
+  }
 
   // ------------------------------------------------------------ IPC：omarchy-shell agent-pet <method> [arg]
   IpcHandler {
     target: "agent-pet"
 
-    function eventFile(path: string): string {
-      return root.handleEventFile(path)
-    }
     function say(text: string): string {
       root.speak("", text, "", "info")
       return "ok"
