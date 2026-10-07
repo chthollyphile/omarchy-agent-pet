@@ -23,7 +23,7 @@ The character, animations, and core pet behavior are ported from [dsh-pet](https
 
 - Omarchy 4
 - The `qt6-imageformats` package, which provides WebP decoding for Qt. Restart the shell with `omarchy-restart-shell` after installing it.
-- `jq`, `curl`, `tar`, `sha256sum`, `notify-send` (all present on a default Omarchy install)
+- `jq` and `notify-send` (both present on a default Omarchy install)
 - Claude Code and/or the Codex CLI for work-status integration
 
 ## Installation
@@ -32,15 +32,7 @@ The character, animations, and core pet behavior are ported from [dsh-pet](https
 omarchy plugin add https://github.com/chthollyphile/omarchy-agent-pet --enable
 ```
 
-### Animation assets
-
-The animation assets (about 177 MB) are not stored in git. When the plugin starts without them, it sends a notification; the download starts only after you click **Download**, and the pet appears when it finishes. The archive is downloaded from the main repository's [GitHub Releases](https://github.com/chthollyphile/agent-pet/releases), verified against the sha256 in `assets.json`, and unpacked into the plugin directory.
-
-To download from a terminal instead:
-
-```bash
-~/.config/omarchy/plugins/chthollyphile.agent-pet/bin/agent-pet-fetch-assets
-```
+The repository includes the animation assets, so the clone is about 180 MB and the pet appears as soon as the plugin is enabled.
 
 ### Connect Claude Code and Codex (optional)
 
@@ -62,7 +54,6 @@ omarchy-shell agent-pet state           # JSON: sessions, usage, configuration s
 omarchy-shell agent-pet say "Hello"
 omarchy-shell agent-pet usage
 omarchy-shell agent-pet toggle          # hide / show
-omarchy-shell agent-pet fetchAssets     # download missing animation assets
 ```
 
 ## Configuration
@@ -93,7 +84,7 @@ Remove the hooks first, because they point to a script inside the plugin directo
 omarchy plugin remove chthollyphile.agent-pet
 ```
 
-Removing the plugin also deletes the downloaded animation assets. To remove your settings and local data as well:
+To remove your settings and local data as well:
 
 ```bash
 rm -rf ~/.config/agent-pet ~/.local/state/agent-pet ~/.cache/agent-pet
@@ -105,15 +96,15 @@ The `.bak-agent-pet-*` backups next to `~/.claude/settings.json` and `~/.codex/h
 
 The plugin runs unsandboxed inside the Omarchy shell with your user permissions.
 
-- **Files written**: the animation assets inside the plugin directory, `~/.local/state/agent-pet/`, and, only when you run the hook installer, `~/.claude/settings.json` and `~/.codex/hooks.json`. It never writes your `config.jsonc`.
-- **Network access**: only to download the animation assets after you confirm.
+- **Files written**: `~/.local/state/agent-pet/` and, only when you run the hook installer, `~/.claude/settings.json` and `~/.codex/hooks.json`. It never writes your `config.jsonc`.
+- **Network access**: none by default. Usage data comes from Omarchy's own `omarchy.agents` collector; only `"usage": {"source": "builtin"}` makes the plugin query Claude / Codex rate limits itself.
 - **Model calls** happen only for the **Murmur** and **Chat** menu actions, the `whisper` and `chat` IPC methods, and the opt-in `whisperAuto` and `stepSummary.mode = "model"` settings. They run your own `claude` or `codex` CLI.
 - **Data forwarded by hooks** is limited to the event name, session ID, project path, tool name, the first line of the tool arguments (up to 120 characters), notification text (up to 200), the first 300 characters of the turn's prompt, the final reply when a turn ends (up to 2000), and the transcript path. It travels over local IPC and never leaves your machine.
 - **Session transcripts** are read only when `stepSummary.mode = "transcript"`, and only the last 400 KB each time.
 
 ## Credits and license
 
-**[dsh-pet](https://github.com/PC2005-cloud/dsh-pet)** (MIT, © PC2005-cloud): the character, the 106 animations, stickers, and icons (transcoded and distributed through Releases), the default configuration, and the physics, animation, and movement logic bundled into `lib/shared.mjs`.
+**[dsh-pet](https://github.com/PC2005-cloud/dsh-pet)** (MIT, © PC2005-cloud): the character, the 106 animations, stickers, and icons under `assets/` (transcoded from dsh-pet), the default configuration, and the physics, animation, and movement logic bundled into `lib/shared.mjs`.
 
 **[Omarchy](https://github.com/basecamp/omarchy)** (MIT, © David Heinemeier Hansson): `bin/agent-pet-usage` ports the rate-limit collection of the `omarchy.agents` plugin.
 

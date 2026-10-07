@@ -23,7 +23,7 @@ Agent Pet 是一个 Omarchy shell 插件（`chthollyphile.agent-pet`），在桌
 
 - Omarchy 4
 - `qt6-imageformats` 软件包：Qt 的 WebP 解码插件。安装后运行 `omarchy-restart-shell` 重启 shell。
-- `jq`、`curl`、`tar`、`sha256sum`、`notify-send`（Omarchy 默认已安装）
+- `jq`、`notify-send`（Omarchy 默认已安装）
 - 需要工作状态联动时：Claude Code 和/或 Codex CLI
 
 ## 安装
@@ -32,15 +32,7 @@ Agent Pet 是一个 Omarchy shell 插件（`chthollyphile.agent-pet`），在桌
 omarchy plugin add https://github.com/chthollyphile/omarchy-agent-pet --enable
 ```
 
-### 动画素材
-
-动画素材（约 177 MB）不在 git 里。插件启动时发现素材缺失，会发送一条通知，点击“下载”后才开始下载，完成后宠物会自动出现。素材包从主仓库的 [GitHub Releases](https://github.com/chthollyphile/agent-pet/releases) 下载，按 `assets.json` 里的 sha256 校验后解压到插件目录。
-
-也可以在终端里下载：
-
-```bash
-~/.config/omarchy/plugins/chthollyphile.agent-pet/bin/agent-pet-fetch-assets
-```
+仓库包含动画素材，clone 约 180 MB，启用插件后宠物会直接出现。
 
 ### 接入 Claude Code 和 Codex（可选）
 
@@ -62,7 +54,6 @@ omarchy-shell agent-pet state           # JSON：会话、用量、配置状态
 omarchy-shell agent-pet say "你好"
 omarchy-shell agent-pet usage
 omarchy-shell agent-pet toggle          # 隐藏 / 显示
-omarchy-shell agent-pet fetchAssets     # 下载缺失的动画素材
 ```
 
 ## 配置
@@ -93,7 +84,7 @@ omarchy plugin update chthollyphile.agent-pet
 omarchy plugin remove chthollyphile.agent-pet
 ```
 
-删除插件时，已下载的动画素材会一并删除。如需同时删除个人设置和本地数据：
+如需同时删除个人设置和本地数据：
 
 ```bash
 rm -rf ~/.config/agent-pet ~/.local/state/agent-pet ~/.cache/agent-pet
@@ -105,15 +96,15 @@ rm -rf ~/.config/agent-pet ~/.local/state/agent-pet ~/.cache/agent-pet
 
 插件在 Omarchy shell 进程内以当前用户权限运行，没有沙箱。
 
-- **写入的文件**：插件目录内的动画素材、`~/.local/state/agent-pet/`，以及仅在你运行 hook 安装脚本时修改的 `~/.claude/settings.json` 和 `~/.codex/hooks.json`。不会写入你的 `config.jsonc`。
-- **网络访问**：只在你确认后下载动画素材。
+- **写入的文件**：`~/.local/state/agent-pet/`，以及仅在你运行 hook 安装脚本时修改的 `~/.claude/settings.json` 和 `~/.codex/hooks.json`。不会写入你的 `config.jsonc`。
+- **网络访问**：默认没有。用量数据来自 Omarchy 自带的 `omarchy.agents` 采集；只有设置 `"usage": {"source": "builtin"}` 时，插件才会自己查询 Claude / Codex 的额度。
 - **模型调用**只发生在菜单的**碎碎念**、**对话**，IPC 的 `whisper`、`chat`，以及需要手动开启的 `whisperAuto` 和 `stepSummary.mode = "model"`。调用的是你本机的 `claude` 或 `codex` CLI。
 - **hooks 转发的数据**仅限：事件名、会话 ID、项目路径、工具名、工具参数首行（最多 120 字符）、通知文本（最多 200 字符）、本轮提问前 300 字符、回合结束时的最终回复（最多 2000 字符）和 transcript 路径。数据通过本地 IPC 传给 Quickshell，不会离开本机。
 - **会话 transcript** 只在 `stepSummary.mode = "transcript"` 时读取，每次只读最后 400 KB。
 
 ## 致谢与许可证
 
-**[dsh-pet](https://github.com/PC2005-cloud/dsh-pet)**（MIT，© PC2005-cloud）：角色、106 个动画、表情包和图标（转码后通过 Releases 分发）、默认配置，以及打包进 `lib/shared.mjs` 的物理、动画选择和移动逻辑。
+**[dsh-pet](https://github.com/PC2005-cloud/dsh-pet)**（MIT，© PC2005-cloud）：角色、`assets/` 下的 106 个动画、表情包和图标（由 dsh-pet 素材转码）、默认配置，以及打包进 `lib/shared.mjs` 的物理、动画选择和移动逻辑。
 
 **[Omarchy](https://github.com/basecamp/omarchy)**（MIT，© David Heinemeier Hansson）：`bin/agent-pet-usage` 移植自 `omarchy.agents` 插件的额度采集。
 

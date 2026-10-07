@@ -623,9 +623,6 @@ Scope {
       root.reloadConfig()
       return "ok"
     }
-    function fetchAssets(): string {
-      return root.fetchAssets()
-    }
     function toggle(): string {
       root.hidden = !root.hidden
       return root.hidden ? "hidden" : "shown"
@@ -650,7 +647,6 @@ Scope {
         autoModel: root.autoModelFor(),
         stepSummary: root.summaryMode(),
         lang: root.lang,
-        assetsReady: root.assetsReady,
         whisperAuto: root.config.whisperAuto === true
       })
     }
@@ -669,104 +665,8 @@ Scope {
     return pets.filter(function(p) { return screenName(p) === screen.name })
   }
 
-  // ------------------------------------------------------------ 动画素材（Release 附件，不在仓库里）
-  // 缺素材时不显示宠物：先等 10 秒再查一次（安装脚本可能正在下载），确认没人在下载才弹通知征求同意
-  property bool assetsReady: false
-  property bool assetsPrompted: false
-  readonly property string fetchScript: root.pluginDir + "/bin/agent-pet-fetch-assets"
-
-  Process {
-    id: assetCheck
-    running: true
-    command: [root.fetchScript, "--check"]
-    onExited: function(exitCode) {
-      if (exitCode === 0) {
-        root.assetsReady = true
-        return
-      }
-      root.assetsReady = false
-      // 3 = 下载进行中：轮询等待；1 = 缺失：稍后再确认一次才提示
-      assetRecheck.interval = exitCode === 3 ? 5000 : 10000
-      assetRecheck.promptAfter = exitCode !== 3
-      assetRecheck.restart()
-    }
-  }
-
-  Timer {
-    id: assetRecheck
-    property bool promptAfter: false
-    onTriggered: assetCheckThenPrompt.running = true
-  }
-
-  Process {
-    id: assetCheckThenPrompt
-    command: [root.fetchScript, "--check"]
-    onExited: function(exitCode) {
-      if (exitCode === 0) {
-        root.assetsReady = true
-      } else if (exitCode === 3) {
-        assetRecheck.interval = 5000
-        assetRecheck.restart()
-      } else if (!root.assetsPrompted && !assetFetch.running) {
-        root.promptAssets()
-      }
-    }
-  }
-
-  FileView {
-    id: assetMeta
-    path: root.pluginDir + "/assets.json"
-    blockLoading: true
-    printErrors: false
-  }
-
-  function assetSizeMb() {
-    try {
-      return Math.round(JSON.parse(assetMeta.text()).size / 1048576)
-    } catch (e) {
-      return "?"
-    }
-  }
-
-  function promptAssets() {
-    assetsPrompted = true
-    assetPrompt.command = ["notify-send", "-a", "agent-pet", "--wait",
-      "-A", "download=" + tr("assetsDownload"),
-      "-A", "later=" + tr("assetsLater"),
-      tr("assetsMissingTitle"), tr("assetsMissingBody", { size: assetSizeMb() })]
-    assetPrompt.running = true
-  }
-
-  // 通知按钮：只有用户点了"下载"才联网
-  Process {
-    id: assetPrompt
-    stdout: StdioCollector { id: assetPromptOut }
-    onExited: if (assetPromptOut.text.trim() === "download") root.fetchAssets()
-  }
-
-  function fetchAssets() {
-    if (assetFetch.running || assetsReady) return assetsReady ? "ready" : "busy"
-    Quickshell.execDetached(["notify-send", "-a", "agent-pet", tr("assetsDownloading")])
-    assetFetch.running = true
-    return "ok"
-  }
-
-  Process {
-    id: assetFetch
-    command: [root.fetchScript, "--yes"]
-    onExited: function(exitCode) {
-      if (exitCode === 0) {
-        Quickshell.execDetached(["notify-send", "-a", "agent-pet", root.tr("assetsDone")])
-        assetCheck.running = true
-      } else {
-        Quickshell.execDetached(["notify-send", "-a", "agent-pet", "-u", "critical",
-          root.tr("assetsFailed", { cmd: root.fetchScript })])
-      }
-    }
-  }
-
   Variants {
-    model: root.ready && root.assetsReady ? Quickshell.screens.filter(function(s) { return root.petsForScreen(s).length > 0 }) : []
+    model: root.ready ? Quickshell.screens.filter(function(s) { return root.petsForScreen(s).length > 0 }) : []
 
     PetOverlay {
       required property var modelData

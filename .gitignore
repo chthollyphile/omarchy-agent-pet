@@ -1,7 +1,0 @@
-# 动画素材由 bin/agent-pet-fetch-assets 下载到插件目录，不进 git
-assets/webp/
-assets/memes/
-assets/pic/
-assets/logo.png
-.assets-download.*/
-assets/.fetching
