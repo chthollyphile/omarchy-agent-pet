@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# 下载 agent-pet 的动画素材（GitHub Release 附件，见 assets.json），校验 sha256 后解压到插件目录。
+#
+# 用法：agent-pet-fetch-assets [--check] [--yes] [--file <本地素材包>]
+#   --check  只检查：素材齐全 exit 0；缺失 exit 1；另一个下载正在进行 exit 3
+#   --yes    不询问，直接下载（插件里点了通知上的“下载”按钮时用）
+#   --file   用本地的素材包代替下载（同样校验 sha256）
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+META=$ROOT/assets.json
+MARKER=$ROOT/assets/.fetching
+zh() { [[ ${LANGUAGE:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}} == zh* ]]; }
+say() { if zh; then echo "$1"; else echo "$2"; fi; }
+
+# config.json 引用的每个动画都要有对应的 webp，另外要有帧率清单、表情包和图标
+assets_complete() {
+  [[ -f $ROOT/assets/webp/manifest.json && -d $ROOT/assets/memes && -d $ROOT/assets/pic ]] || return 1
+  local name
+  while IFS= read -r name; do
+    [[ -f $ROOT/assets/webp/$name.webp ]] || return 1
+  done < <(jq -r '.animations | [.idle[], .turn[], .drag[], .clicks[], .moves.actions[].name, .categories[].actions[],
+    (.events[][] | if type == "array" then .[] else . end)] | unique[]' "$ROOT/assets/config.json")
+}
+
+fetching() {
+  [[ -f $MARKER ]] && kill -0 "$(cat "$MARKER" 2>/dev/null)" 2>/dev/null
+}
+
+check=0
+yes=0
+file=""
+while (( $# )); do
+  case $1 in
+    --check) check=1; shift ;;
+    --yes | -y) yes=1; shift ;;
+    --file) file=$2; shift 2 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+if (( check )); then
+  assets_complete && exit 0
+  fetching && exit 3
+  exit 1
+fi
+
+if assets_complete; then
+  say "素材已齐全：$ROOT/assets" "Assets are already complete: $ROOT/assets"
+  exit 0
+fi
+if fetching; then
+  say "另一个下载正在进行（pid $(cat "$MARKER")）" "Another download is in progress (pid $(cat "$MARKER"))"
+  exit 3
+fi
+[[ -f $META ]] || { say "缺少 assets.json，无法下载素材" "assets.json is missing; cannot download assets" >&2; exit 2; }
+
+url=$(jq -r .url "$META")
+sha=$(jq -r .sha256 "$META")
+size_mb=$(( $(jq -r .size "$META") / 1048576 ))
+
+if (( ! yes )) && [[ -z $file ]]; then
+  if zh; then prompt="下载动画素材（约 ${size_mb} MB）到 $ROOT/assets？[Y/n] "; else prompt="Download animation assets (~${size_mb} MB) into $ROOT/assets? [Y/n] "; fi
+  read -r -p "$prompt" answer </dev/tty || answer=n
+  [[ $answer =~ ^[Nn] ]] && exit 1
+fi
+
+mkdir -p "$ROOT/assets"
+echo $$ > "$MARKER"
+# 临时目录放在插件目录里：解压后 mv 是同一文件系统内的改名，不占 /tmp
+tmp=$(mktemp -d "$ROOT/.assets-download.XXXXXX")
+trap 'rm -rf "$tmp"; rm -f "$MARKER"' EXIT
+
+if [[ -n $file ]]; then
+  cp -- "$file" "$tmp/assets.tar"
+else
+  say "下载 $url" "Downloading $url"
+  curl -fL --retry 3 --progress-bar -o "$tmp/assets.tar" "$url"
+fi
+
+echo "$sha  $tmp/assets.tar" | sha256sum -c --status || {
+  say "sha256 校验失败，已放弃" "sha256 mismatch; aborted" >&2
+  exit 2
+}
+# 只接受 assets/webp、memes、pic 下的普通文件和目录
+if tar -tvf "$tmp/assets.tar" | awk '{print substr($1,1,1), $NF}' | grep -vE '^[-d] assets/(webp|memes|pic)(/|$)' | grep -q .; then
+  say "素材包里有意外的条目，已放弃" "Unexpected entries in the asset archive; aborted" >&2
+  exit 2
+fi
+
+mkdir "$tmp/x"
+tar -xf "$tmp/assets.tar" -C "$tmp/x" --no-same-owner --no-same-permissions
+for d in webp memes pic; do
+  rm -rf "$ROOT/assets/$d"
+  mv "$tmp/x/assets/$d" "$ROOT/assets/$d"
+done
+
+say "素材已安装到 $ROOT/assets" "Assets installed into $ROOT/assets"

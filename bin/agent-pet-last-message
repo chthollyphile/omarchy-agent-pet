@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# 从 Claude Code / Codex 会话记录（JSONL）末尾取本轮最新的一段 assistant 文字。
+# 用法：agent-pet-last-message <transcript_path> [since_iso]
+#   since_iso：本轮开始时间（ISO 8601 UTC），早于它的记录忽略，避免显示上一轮的话。
+# 只读文件最后 400 KB；输出最多 2000 字，没有找到时输出为空。
+path=${1:-}
+since=${2:-}
+[[ -f $path ]] || exit 0
+tail -c 400000 -- "$path" | jq -Rr --arg since "$since" '
+  fromjson?
+  | select((.timestamp // "") >= $since)
+  | if .type == "assistant" then
+      (.message.content[]? | select(.type == "text") | .text)
+    elif .type == "response_item" and .payload.type == "message" and .payload.role == "assistant" then
+      (.payload.content[]? | select(.type == "output_text") | .text)
+    else empty end
+  | select(test("\\S"))
+  | @json
+' 2>/dev/null | tail -n 1 | jq -r '.[0:2000]' 2>/dev/null

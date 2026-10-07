@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# 把 agent-pet-hook 挂到 Claude Code（~/.claude/settings.json）和 Codex（~/.codex/hooks.json）上。
+# 幂等：先删掉已有的 agent-pet-hook 条目再追加；改动前把原文件备份成 <file>.bak-agent-pet-<时间戳>。
+#
+# 用法：agent-pet-install-hooks [--uninstall] [--claude-only | --codex-only]
+set -euo pipefail
+
+HOOK=$(cd "$(dirname "$0")" && pwd)/agent-pet-hook
+CLAUDE_SETTINGS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+CODEX_HOOKS=${CODEX_HOME:-$HOME/.codex}/hooks.json
+
+CLAUDE_EVENTS='["UserPromptSubmit","PreToolUse","PostToolUse","PostToolUseFailure","PermissionRequest","Elicitation","Notification","Stop","StopFailure","SessionEnd"]'
+CODEX_EVENTS='["UserPromptSubmit","PreToolUse","PostToolUse","PermissionRequest","Stop","SessionEnd"]'
+
+mode=install
+targets="claude codex"
+for arg in "$@"; do
+  case $arg in
+    --uninstall) mode=uninstall ;;
+    --claude-only) targets=claude ;;
+    --codex-only) targets=codex ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# $1 = 文件，$2 = agent 名，$3 = 事件列表 JSON
+patch_file() {
+  local file=$1 agent=$2 events=$3
+  mkdir -p "$(dirname "$file")"
+  [[ -s $file ]] || echo '{}' > "$file"
+  cp "$file" "$file.bak-agent-pet-$(date +%Y%m%d%H%M%S)"
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg cmd "$HOOK $agent" --argjson events "$events" --arg mode "$mode" '
+    # 先移除所有 agent-pet-hook 条目（含改名前的 omar-pet-hook），删空的 matcher 组和事件
+    .hooks = ((.hooks // {})
+      | with_entries(.value = [.value[]
+          | .hooks = [.hooks[] | select((.command // "") | test("(agent|omar)-pet-hook") | not)]
+          | select(.hooks | length > 0)])
+      | with_entries(select(.value | length > 0)))
+    | if $mode == "install" then
+        reduce $events[] as $e (.;
+          .hooks[$e] = ((.hooks[$e] // []) + [{ hooks: [{ type: "command", command: $cmd, timeout: 5 }] }]))
+      else . end
+    | if (.hooks | length) == 0 then del(.hooks) else . end
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  echo "$mode: $file"
+}
+
+for t in $targets; do
+  case $t in
+    claude) patch_file "$CLAUDE_SETTINGS" claude "$CLAUDE_EVENTS" ;;
+    codex) patch_file "$CODEX_HOOKS" codex "$CODEX_EVENTS" ;;
+  esac
+done

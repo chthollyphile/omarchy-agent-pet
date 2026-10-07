@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Claude Code / Codex hook 桥接：把 hook 事件转发给 omarchy-shell 里的 agent-pet 插件。
+# 用法（hooks 配置里的 command）：agent-pet-hook claude | agent-pet-hook codex
+#
+# 约束：
+# - stdout 不输出任何内容（UserPromptSubmit / SessionStart 的 stdout 会被注入模型上下文）；
+# - 始终 exit 0，且立即返回：真正的 IPC 调用放到后台，不拖慢 agent。
+# - AGENT_PET_INTERNAL=1 时直接退出：宠物自己调用 claude -p / codex exec 时不回灌事件。
+
+[[ ${AGENT_PET_INTERNAL:-} == 1 ]] && exit 0
+agent=${1:-claude}
+payload=$(cat)
+
+# 发事件的终端是否在前台：从本进程沿父进程链向上，看能否碰到 Hyprland 当前窗口的 pid
+focused=false
+active_pid=$(hyprctl activewindow -j 2>/dev/null | jq -r '.pid // empty' 2>/dev/null)
+if [[ -n $active_pid ]]; then
+  pid=$$
+  while [[ -n $pid && $pid -gt 1 ]]; do
+    if [[ $pid == "$active_pid" ]]; then focused=true; break; fi
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+  done
+fi
+
+# 只挑需要的字段：tool_input / tool_response 可能很大，不能整个塞进 IPC 参数
+event=$(jq -c --arg agent "$agent" --argjson focused "$focused" '{
+  agent: $agent,
+  event: (.hook_event_name // ""),
+  session: (.session_id // ""),
+  cwd: (.cwd // ""),
+  tool: (.tool_name // ""),
+  notificationType: (.notification_type // ""),
+  message: ((.message // .error // "") | tostring | .[0:200]),
+  # 工具参数摘要：命令 / 文件路径 / 搜索词等，取第一行前 120 字
+  detail: ((.tool_input // {})
+    | if type == "object" then (.command // .cmd // .file_path // .path // .pattern // .url // .query // .description // "") else . end
+    | if type == "array" then map(tostring) | join(" ") else tostring end
+    | (split("\n")[0] // "") | .[0:120]),
+  # 用户这一轮的请求（步骤总结用），只在 UserPromptSubmit 时带，截前 300 字
+  prompt: (if .hook_event_name == "UserPromptSubmit" then ((.prompt // "") | tostring | .[0:300]) else "" end),
+  # 会话记录路径（stepSummary.mode = transcript 时宠物自己去读）和 Stop 时的最后一条回复
+  transcript: (.transcript_path // ""),
+  lastMessage: ((.last_assistant_message // "") | tostring | .[0:2000]),
+  focused: $focused
+}' <<<"$payload" 2>/dev/null) || exit 0
+
+# 先交给 Omarchy 里的 agent-pet 插件；没有 Omarchy 或插件没启用时，交给独立模式实例（qs -p <仓库目录>）
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+(
+  if command -v omarchy-shell >/dev/null && omarchy-shell agent-pet event "$event"; then exit 0; fi
+  qs ipc -p "$root" call agent-pet event "$event"
+) </dev/null >/dev/null 2>&1 &
+disown
+exit 0

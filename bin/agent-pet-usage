@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""agent-pet-usage: collect Claude Code / Codex rate limits into usage records.
+
+Fallback for environments without Omarchy. On Omarchy, agent-pet reads the
+records written by Omarchy's own `omarchy-agent-usage-update` instead and
+never runs this script.
+
+The limits logic is ported from Omarchy's `omarchy-agent-usage-claude` and
+`omarchy-agent-usage-codex` collectors (the omarchy.agents plugin), keeping
+their behavior and record contract for the fields agent-pet reads:
+  - Claude: Anthropic's OAuth usage endpoint with the Claude Code CLI's
+    saved login; percent-scale detection, model-scoped windows, a short
+    probe-reuse window, and last-known limits kept until their window resets.
+  - Codex: `codex app-server` JSON-RPC `account/rateLimits/read`.
+Local token statistics from the original collectors are not ported.
+
+Omarchy — https://github.com/basecamp/omarchy
+Copyright (c) David Heinemeier Hansson
+Released under the MIT License (see LICENSE in this repository).
+
+Usage: agent-pet-usage [--force] [--out-dir DIR] [claude] [codex]
+Writes <DIR>/<agent>.json (default ~/.local/state/agent-pet/usage).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+PROBE_MIN_INTERVAL_SECONDS = 15
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def number(value: Any) -> int:
+  try:
+    return int(float(value or 0))
+  except Exception:
+    return 0
+
+
+def state_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "agent-pet" / "usage"
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-pet" / "usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def read_json(path: Path) -> dict[str, Any]:
+  try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+  except Exception:
+    return {}
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+  # Atomic replace so a reader watching the file never sees half a record.
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name, suffix=".tmp")
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump(payload, handle, separators=(",", ":"), ensure_ascii=False)
+    os.replace(tmp, path)
+  except Exception:
+    try:
+      os.unlink(tmp)
+    except Exception:
+      pass
+    raise
+
+
+def now_iso() -> str:
+  return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+# ------------------------------------------------------------------ claude
+# Ported from omarchy-agent-usage-claude (limits part).
+
+
+def claude_config_dir() -> Path:
+  return Path(os.path.expandvars(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))).resolve()
+
+
+def oauth_login(claude_dir: Path) -> tuple[str, int, str]:
+  # The token goes nowhere but the Authorization header of the limits probe;
+  # only the plan label travels into the record.
+  data = read_json(claude_dir / ".credentials.json")
+  login = data.get("claudeAiOauth")
+  if not isinstance(login, dict):
+    return "", 0, ""
+  plan = plan_label(str(login.get("rateLimitTier") or ""), str(login.get("subscriptionType") or ""))
+  return str(login.get("accessToken") or ""), number(login.get("expiresAt")), plan
+
+
+def plan_label(tier: str, subscription: str) -> str:
+  if tier:
+    match = re.search(r"max_(\d+x)", tier, re.IGNORECASE)
+    if match:
+      return "Max " + match.group(1)
+  if subscription:
+    return subscription[0].upper() + subscription[1:]
+  return ""
+
+
+def parse_utilization(value: Any) -> float:
+  try:
+    return float(str(value).strip().replace("%", ""))
+  except Exception:
+    return float("nan")
+
+
+def normalize_utilization(value: Any, percent_scale: bool) -> float:
+  n = parse_utilization(value)
+  if not (n >= 0):
+    return -1.0
+  # The endpoint reports percentages (37.0); older payloads used fractions
+  # (0.37). A payload containing any value >= 1 is percent-scaled.
+  if percent_scale or n > 1:
+    return min(1.0, n / 100.0)
+  return min(1.0, n)
+
+
+def normalize_reset_at(value: Any) -> str:
+  if value is None:
+    return ""
+  raw = str(value).strip()
+  if raw == "":
+    return ""
+  if raw.isdigit():
+    ts = int(raw)
+    if ts < 1e12:
+      ts *= 1000
+    try:
+      return dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).isoformat()
+    except Exception:
+      return raw
+  try:
+    return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
+  except Exception:
+    return raw
+
+
+def usage_bucket(payload: dict[str, Any], key: str) -> dict[str, Any] | None:
+  bucket = payload.get(key)
+  return bucket if isinstance(bucket, dict) else None
+
+
+def scoped_window(kind: str) -> str:
+  text = kind.lower()
+  if "month" in text:
+    return "Monthly"
+  if "week" in text or "day" in text:
+    return "Weekly"
+  if "hour" in text or "session" in text:
+    return "Session"
+  return ""
+
+
+def scoped_limits(payload: dict[str, Any], percent_scale: bool) -> list[dict[str, Any]]:
+  # Model-scoped allowances only appear in the `limits` array.
+  entries = payload.get("limits")
+  if not isinstance(entries, list):
+    return []
+  out: list[dict[str, Any]] = []
+  seen: set[tuple[str, str]] = set()
+  for entry in entries:
+    if not isinstance(entry, dict):
+      continue
+    scope = entry.get("scope")
+    model = scope.get("model") if isinstance(scope, dict) else None
+    if not isinstance(model, dict):
+      continue
+    name = str(model.get("display_name") or model.get("id") or "").strip()
+    kind = str(entry.get("kind") or "").strip()
+    if name == "" or (name, kind) in seen:
+      continue
+    percent = normalize_utilization(entry.get("percent"), percent_scale)
+    if percent < 0:
+      continue
+    seen.add((name, kind))
+    window = scoped_window(kind)
+    title = name + " " + window if window else name
+    out.append({"label": title, "title": title, "percent": percent, "resetsAt": normalize_reset_at(entry.get("resets_at"))})
+  return out
+
+
+def probe_claude_limits(access_token: str) -> dict[str, Any]:
+  request = urllib.request.Request(
+    USAGE_ENDPOINT,
+    headers={
+      "Authorization": "Bearer " + access_token,
+      "anthropic-beta": "oauth-2025-04-20",
+      "Accept": "application/json",
+    },
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+      payload = json.loads(response.read().decode("utf-8", errors="replace"))
+  except urllib.error.HTTPError as error:
+    if error.code == 429:
+      return {"ok": False, "helpText": "Anthropic's usage endpoint is rate limiting checks right now."}
+    return {"ok": False, "helpText": f"Anthropic's usage endpoint returned status {error.code}."}
+  except Exception:
+    return {"ok": False, "transport": True, "helpText": "Couldn't reach Anthropic's usage endpoint."}
+
+  weekly = usage_bucket(payload, "seven_day_oauth_apps") or usage_bucket(payload, "seven_day")
+  session = usage_bucket(payload, "five_hour")
+  raw = [session.get("utilization") if session else None, weekly.get("utilization") if weekly else None]
+  entries = payload.get("limits")
+  if isinstance(entries, list):
+    raw += [entry.get("percent") for entry in entries if isinstance(entry, dict)]
+  percent_scale = any(parse_utilization(v) >= 1 for v in raw)
+
+  limits = []
+  if session is not None:
+    percent = normalize_utilization(session.get("utilization"), percent_scale)
+    if percent >= 0:
+      limits.append({"label": "Session (5-hour)", "percent": percent, "resetsAt": normalize_reset_at(session.get("resets_at"))})
+  if weekly is not None:
+    percent = normalize_utilization(weekly.get("utilization"), percent_scale)
+    if percent >= 0:
+      limits.append({"label": "Weekly (7-day)", "percent": percent, "resetsAt": normalize_reset_at(weekly.get("resets_at"))})
+  limits.extend(scoped_limits(payload, percent_scale))
+  if not limits:
+    return {"ok": False, "helpText": "Anthropic's usage endpoint returned no limits."}
+  return {"ok": True, "limits": limits}
+
+
+def limit_window_open(entry: dict[str, Any], now: dt.datetime) -> bool:
+  # A cached percentage is only kept until its window rolls over.
+  raw = str(entry.get("resetsAt") or "")
+  if raw == "":
+    return True
+  try:
+    resets_at = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+  except Exception:
+    return True
+  if resets_at.tzinfo is None:
+    resets_at = resets_at.replace(tzinfo=dt.timezone.utc)
+  return resets_at > now
+
+
+def usable_cached_limits(cached: dict[str, Any]) -> list[dict[str, Any]]:
+  entries = cached.get("limits")
+  if not isinstance(entries, list):
+    return []
+  now = dt.datetime.now(dt.timezone.utc)
+  return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
+
+
+def collect_claude(force: bool) -> dict[str, Any] | None:
+  claude_dir = claude_config_dir()
+  if not claude_dir.exists():
+    return None
+  access_token, expires_at_ms, plan = oauth_login(claude_dir)
+  result: dict[str, Any] = {"limits": [], "usageStatusText": "", "authHelpText": "Run `claude auth login` to restore usage limits."}
+
+  probe_cache = cache_root() / "claude-limits.json"
+  cached = read_json(probe_cache)
+  fallback = usable_cached_limits(cached)
+
+  if access_token == "":
+    result["limits"] = fallback
+    result["usageStatusText"] = "Waiting for auth"
+  elif expires_at_ms > 0 and expires_at_ms <= time.time() * 1000:
+    # Only the Claude Code CLI refreshes the saved token.
+    result["limits"] = fallback
+    result["usageStatusText"] = "Sign-in expired"
+    result["authHelpText"] = "Claude Code's saved sign-in expired. Start Claude Code, or run `claude auth login`, to refresh it."
+  elif fallback and not force and time.time() - number(cached.get("fetchedAtMs")) / 1000 < PROBE_MIN_INTERVAL_SECONDS:
+    result["limits"] = fallback
+  else:
+    probe = probe_claude_limits(access_token)
+    if probe["ok"]:
+      result["limits"] = probe["limits"]
+      write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "limits": probe["limits"]})
+    else:
+      if probe.get("transport"):
+        result["retryAdvised"] = True
+      if fallback:
+        result["limits"] = fallback
+      else:
+        result["usageStatusText"] = "Claude limits unavailable"
+        result["authHelpText"] = probe["helpText"]
+
+  return {
+    "schemaVersion": 1,
+    "id": "claude",
+    "name": "Claude Code",
+    "updatedAt": now_iso(),
+    "ready": len(result["limits"]) > 0,
+    "tierLabel": plan,
+    **result,
+  }
+
+
+# ------------------------------------------------------------------ codex
+# Ported from omarchy-agent-usage-codex (rate limits part).
+
+
+def runtime_env() -> dict[str, str]:
+  home = str(Path.home())
+  parts = [os.environ.get("PATH", ""), f"{home}/.local/bin", f"{home}/.npm-global/bin", f"{home}/.local/share/mise/shims"]
+  env = os.environ.copy()
+  env["PATH"] = os.pathsep.join(part for part in parts if part)
+  return env
+
+
+def rpc_request(proc: subprocess.Popen, request_id: int, method: str, params: dict | None = None, timeout: float = 8) -> dict:
+  proc.stdin.write(json.dumps({"id": request_id, "method": method, "params": params or {}}) + "\n")
+  proc.stdin.flush()
+  deadline = time.time() + timeout
+  while time.time() < deadline:
+    ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+    if not ready:
+      continue
+    line = proc.stdout.readline()
+    if not line:
+      break
+    try:
+      message = json.loads(line)
+    except Exception:
+      continue
+    if message.get("id") == request_id:
+      return message
+  raise TimeoutError(method)
+
+
+def codex_limit_window(window: Any) -> dict[str, Any] | None:
+  if not isinstance(window, dict):
+    return None
+  used = window.get("usedPercent")
+  if used is None:
+    return None
+  mins = number(window.get("windowDurationMins"))
+  if mins == 10080:
+    label = "Weekly (7-day)"
+  elif mins and mins % 60 == 0:
+    label = f"{mins // 60}h window"
+  elif mins:
+    label = f"{mins}m window"
+  else:
+    label = "Limit"
+  reset = window.get("resetsAt")
+  return {
+    "label": label,
+    "percent": float(used) / 100.0,
+    "resetsAt": dt.datetime.fromtimestamp(number(reset), dt.timezone.utc).isoformat() if reset else "",
+  }
+
+
+def collect_codex() -> dict[str, Any] | None:
+  env = runtime_env()
+  codex = shutil.which("codex", path=env.get("PATH"))
+  if not codex:
+    return None
+  result: dict[str, Any] = {"limits": [], "tierLabel": "", "usageStatusText": "", "authHelpText": "Run `codex login` to authenticate."}
+  try:
+    proc = subprocess.Popen(
+      [codex, "-s", "read-only", "-a", "on-request", "app-server"],
+      stdin=subprocess.PIPE,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+      text=True,
+      env=env,
+    )
+  except Exception as exc:
+    result["usageStatusText"] = "Codex unavailable"
+    result["authHelpText"] = str(exc)
+  else:
+    try:
+      rpc_request(proc, 1, "initialize", {"clientInfo": {"name": "agent-pet-usage", "version": "1"}}, timeout=8)
+      proc.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
+      proc.stdin.flush()
+      account_msg = rpc_request(proc, 2, "account/read", timeout=4)
+      limits_msg = rpc_request(proc, 3, "account/rateLimits/read", timeout=4)
+      account = (account_msg.get("result") or {}).get("account") or {}
+      limits = (limits_msg.get("result") or {}).get("rateLimits") or {}
+      plan = limits.get("planType") or account.get("planType") or account.get("type") or ""
+      result["tierLabel"] = str(plan) if plan else ""
+      for window in (limits.get("primary"), limits.get("secondary")):
+        entry = codex_limit_window(window)
+        if entry:
+          result["limits"].append(entry)
+    except Exception as exc:
+      result["usageStatusText"] = "Codex limits unavailable"
+      result["authHelpText"] = str(exc)
+    finally:
+      try:
+        proc.terminate()
+        proc.wait(timeout=1)
+      except Exception:
+        try:
+          proc.kill()
+        except Exception:
+          pass
+
+  return {
+    "schemaVersion": 1,
+    "id": "codex",
+    "name": "Codex",
+    "updatedAt": now_iso(),
+    "ready": len(result["limits"]) > 0,
+    **result,
+  }
+
+
+# ------------------------------------------------------------------ main
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+  parser.add_argument("agents", nargs="*", choices=["claude", "codex"], default=[])
+  parser.add_argument("--force", action="store_true", help="re-probe Claude limits even if a recent probe exists")
+  parser.add_argument("--out-dir", type=Path, default=None)
+  args = parser.parse_args()
+
+  out_dir = args.out_dir or state_dir()
+  collectors = {"claude": lambda: collect_claude(args.force), "codex": collect_codex}
+  status = 0
+  for agent in args.agents or ["claude", "codex"]:
+    try:
+      record = collectors[agent]()
+    except Exception as exc:
+      print(f"agent-pet-usage: {agent} collector failed: {exc}", file=os.sys.stderr)
+      status = 1
+      continue
+    if record is None:
+      continue  # CLI not installed: no record, the pet simply shows none
+    write_json(out_dir / f"{agent}.json", record)
+  return status
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

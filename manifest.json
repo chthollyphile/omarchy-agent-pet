@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "chthollyphile.agent-pet",
+  "name": "Agent Pet",
+  "version": "0.1.0",
+  "author": "lia",
+  "license": "MIT",
+  "description": "Desktop pet ported from dsh-pet: idle animations, drag and throw, and live Claude Code / Codex work status via hooks.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
