@@ -6,6 +6,8 @@
 # - stdout 不输出任何内容（UserPromptSubmit / SessionStart 的 stdout 会被注入模型上下文）；
 # - 始终 exit 0，且立即返回：真正的 IPC 调用放到后台，不拖慢 agent。
 # - AGENT_PET_INTERNAL=1 时直接退出：宠物自己调用 claude -p / codex exec 时不回灌事件。
+# - 事件内容（提问、工具参数、回复摘录）不放进任何命令行参数：进程参数对本机所有用户可见。
+#   内容写进只有本用户能读的临时文件，IPC 只传文件路径，宠物同步读完后这里删除。
 
 [[ ${AGENT_PET_INTERNAL:-} == 1 ]] && exit 0
 agent=${1:-claude}
@@ -42,13 +44,22 @@ event=$(jq -c --arg agent "$agent" --argjson focused "$focused" '{
   transcript: (.transcript_path // ""),
   lastMessage: ((.last_assistant_message // "") | tostring | .[0:2000]),
   focused: $focused
-}' <<<"$payload" 2>/dev/null) || exit 0
+}' 2>/dev/null <<<"$payload") || exit 0
+
+# 与 Service.qml 的 eventDirs 一致
+if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then dir=$XDG_RUNTIME_DIR/agent-pet; else dir=$HOME/.local/state/agent-pet/events; fi
+umask 077
+mkdir -p "$dir" && chmod 700 "$dir" || exit 0
+file=$(mktemp --suffix=.json "$dir/event.XXXXXXXXXX") || exit 0
+printf '%s' "$event" > "$file" || { rm -f "$file"; exit 0; }
 
 # 先交给 Omarchy 里的 agent-pet 插件；没有 Omarchy 或插件没启用时，交给独立模式实例（qs -p <仓库目录>）
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 (
-  if command -v omarchy-shell >/dev/null && omarchy-shell agent-pet event "$event"; then exit 0; fi
-  qs ipc -p "$root" call agent-pet event "$event"
+  if ! { command -v omarchy-shell >/dev/null && omarchy-shell agent-pet eventFile "$file"; }; then
+    qs ipc -p "$root" call agent-pet eventFile "$file"
+  fi
+  rm -f "$file"
 ) </dev/null >/dev/null 2>&1 &
 disown
 exit 0

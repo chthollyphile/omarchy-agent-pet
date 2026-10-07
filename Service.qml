@@ -20,6 +20,9 @@ Scope {
   readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, ""))
   readonly property string userConfigPath: home + "/.config/agent-pet/config.jsonc"
   readonly property string stateDir: home + "/.local/state/agent-pet"
+  // hook 事件的临时文件目录，与 bin/agent-pet-hook 一致
+  readonly property string eventDir: Quickshell.env("XDG_RUNTIME_DIR")
+    ? Quickshell.env("XDG_RUNTIME_DIR") + "/agent-pet" : stateDir + "/events"
 
   // ------------------------------------------------------------ 配置
   property var config: ({})
@@ -125,6 +128,27 @@ Scope {
     return a[agent] !== false
   }
 
+  // hook 把事件写进 eventDir 下只有本用户可读的文件，IPC 只传路径（事件内容不进进程参数）。
+  // 这里同步读完，hook 在 IPC 返回后删除文件。
+  FileView {
+    id: eventFileView
+    blockLoading: true
+    printErrors: false
+  }
+
+  function handleEventFile(path) {
+    var p = String(path || "")
+    if (p.indexOf(eventDir + "/") !== 0 || !/^event\.[A-Za-z0-9]+\.json$/.test(p.slice(eventDir.length + 1)))
+      return "bad-path"
+    eventFileView.path = p
+    eventFileView.reload()
+    eventFileView.waitForJob()
+    if (!eventFileView.loaded) return "unreadable"
+    var json = eventFileView.text()
+    eventFileView.path = ""
+    return handleEvent(json)
+  }
+
   function handleEvent(json) {
     var ev
     try {
@@ -186,13 +210,12 @@ Scope {
     var onlyUnfocused = !config.notify || config.notify.onlyWhenUnfocused !== false
     if (onlyUnfocused && entry.focused) return
     var agentName = entry.agent === "codex" ? "Codex" : "Claude Code"
-    var project = WS.projectName(entry.cwd)
-    var body = entry.message || (entry.tool ? entry.tool : "")
+    // notify-send 只能从命令行参数拿文本，而进程参数对本机所有用户可见：
+    // 通知里只放固定文字，项目名、消息和工具等内容只显示在宠物气泡里
     Quickshell.execDetached([
       "notify-send", "-a", "agent-pet",
       "-i", root.pluginDir + "/assets/pic/notify-" + notifyIcons[entry.state] + ".png",
-      agentName + (project ? " · " + project : "") + " · " + title,
-      body
+      agentName + " · " + title
     ])
   }
 
@@ -363,6 +386,7 @@ Scope {
   // ------------------------------------------------------------ 碎碎念 / 对话（只在显式触发或 whisperAuto 开启时调用 LLM）
   Llm {
     id: llm
+    name: "chat"
     lang: root.lang
     home: root.home
     stateDir: root.stateDir
@@ -381,6 +405,7 @@ Scope {
   // 自动任务（步骤总结、定时碎碎念）专用：独立实例，不和手动对话抢；用 autoModel 指定的便宜模型
   Llm {
     id: autoLlm
+    name: "auto"
     lang: root.lang
     home: root.home
     stateDir: root.stateDir
@@ -426,7 +451,12 @@ Scope {
       return
     }
     narrationProc.key = entry.key
-    narrationProc.command = [root.pluginDir + "/bin/agent-pet-last-message", entry.transcript, new Date(entry.turnAt - 2000).toISOString()]
+    // 会话记录路径含项目路径和会话 ID，走环境变量（只有本用户可读），不放进进程参数
+    narrationProc.environment = ({
+      AGENT_PET_TRANSCRIPT: entry.transcript,
+      AGENT_PET_SINCE: new Date(entry.turnAt - 2000).toISOString()
+    })
+    narrationProc.command = [root.pluginDir + "/bin/agent-pet-last-message"]
     narrationProc.running = true
   }
 
@@ -592,14 +622,15 @@ Scope {
     }
   }
 
-  Component.onCompleted: Quickshell.execDetached(["mkdir", "-p", root.stateDir])
+  // 对话记忆和模型提示词文件只给本用户读
+  Component.onCompleted: Quickshell.execDetached(["bash", "-c", 'mkdir -p -m 700 "$0" && chmod 700 "$0"', root.stateDir])
 
   // ------------------------------------------------------------ IPC：omarchy-shell agent-pet <method> [arg]
   IpcHandler {
     target: "agent-pet"
 
-    function event(json: string): string {
-      return root.handleEvent(json)
+    function eventFile(path: string): string {
+      return root.handleEventFile(path)
     }
     function say(text: string): string {
       root.speak("", text, "", "info")

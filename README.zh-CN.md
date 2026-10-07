@@ -14,7 +14,7 @@ Agent Pet 是一个 Omarchy shell 插件（`chthollyphile.agent-pet`），在桌
 
 - **桌宠行为**：待机、随机动作、转向、行走、点击回应，以及带物理效果的拖拽与甩抛。
 - **工作状态联动**：通过 Claude Code / Codex 的 hooks 接收事件，在思考、工作、整理、等待、成功、出错 6 种状态之间切换。气泡可显示项目名、当前工具与命令摘要，以及 agent 自己写的步骤说明。
-- **等待提醒**：需要确认、任务完成或出错时显示气泡；发出事件的终端不在前台时，同时发送系统通知。
+- **等待提醒**：需要确认、任务完成或出错时显示气泡；发出事件的终端不在前台时，同时发送系统通知（只含 agent 名称和状态）。
 - **用量显示**：使用 Omarchy `omarchy.agents` 的数据，列出每个额度窗口的用量和重置倒计时。
 - **碎碎念与对话**：通过 `claude -p` 或 `codex exec` 生成，只在你主动触发时调用。
 - **中英文界面**：根据系统语言自动选择。
@@ -99,8 +99,10 @@ rm -rf ~/.config/agent-pet ~/.local/state/agent-pet ~/.cache/agent-pet
 - **写入的文件**：`~/.local/state/agent-pet/`，以及仅在你运行 hook 安装脚本时修改的 `~/.claude/settings.json` 和 `~/.codex/hooks.json`。不会写入你的 `config.jsonc`。
 - **网络访问**：默认没有。用量数据来自 Omarchy 自带的 `omarchy.agents` 采集；只有设置 `"usage": {"source": "builtin"}` 时，插件才会自己查询 Claude / Codex 的额度。
 - **模型调用**只发生在菜单的**碎碎念**、**对话**，IPC 的 `whisper`、`chat`，以及需要手动开启的 `whisperAuto` 和 `stepSummary.mode = "model"`。调用的是你本机的 `claude` 或 `codex` CLI。
-- **hooks 转发的数据**仅限：事件名、会话 ID、项目路径、工具名、工具参数首行（最多 120 字符）、通知文本（最多 200 字符）、本轮提问前 300 字符、回合结束时的最终回复（最多 2000 字符）和 transcript 路径。数据通过本地 IPC 传给 Quickshell，不会离开本机。
+- **hooks 转发的数据**仅限：事件名、会话 ID、项目路径、工具名、工具参数首行（最多 120 字符）、通知文本（最多 200 字符）、本轮提问前 300 字符、回合结束时的最终回复（最多 2000 字符）和 transcript 路径。数据不会离开本机。
 - **会话 transcript** 只在 `stepSummary.mode = "transcript"` 时读取，每次只读最后 400 KB。
+- **进程参数里不放私密内容**：本机其他用户能看到所有进程的命令行。hook 事件经 `$XDG_RUNTIME_DIR/agent-pet/` 下的私有文件传递（目录权限 700，宠物读完立即删除）；提示词和对话历史通过标准输入交给 `claude` / `codex`，系统提示词写在私有文件里；系统通知只包含 agent 名称和状态。你自己通过 `omarchy-shell agent-pet say` 或 `chat` 传入的文字会出现在该命令的命令行里。
+- **`~/.local/state/agent-pet/`**（对话记录、提示词文件）权限保持为 700。
 
 ## 致谢与许可证
 

@@ -5,9 +5,13 @@ import "lib/i18n.mjs" as I18n
 
 // 无头调用 claude -p / codex exec 生成一句话。一次只跑一个请求。
 // AGENT_PET_INTERNAL=1：agent-pet-hook 看到它直接退出，宠物自己的调用不会回灌成工作状态事件。
+// 提示词和对话历史不放进命令行参数（进程参数对本机所有用户可见）：
+// 提示词走 stdin，Claude 的系统提示词写进 stateDir（0700）下的文件，用 --system-prompt-file 传路径。
 Scope {
   id: llm
 
+  // 区分多个实例的系统提示词文件
+  property string name: "llm"
   property string lang: "zh"
   property string home: ""
   property string stateDir: ""
@@ -29,14 +33,17 @@ Scope {
     if (proc.running) return false
     var cmd
     if (provider === "codex") {
+      // 不给 PROMPT 参数时 codex exec 从 stdin 读指令
       cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "--color", "never"]
       if (model) cmd.push("-m", model)
       if (cheap) cmd.push("-c", "model_reasoning_effort=\"low\"")
-      cmd.push(systemPrompt + "\n\n" + prompt)
+      proc.input = systemPrompt + "\n\n" + prompt
     } else {
-      // prompt 紧跟 -p：--tools 是变长参数，放在它后面会被当成工具名吃掉
-      cmd = ["claude", "-p", prompt,
-        "--system-prompt", systemPrompt,
+      systemFile.setText(systemPrompt)
+      // 不给 prompt 参数时 claude -p 从 stdin 读
+      proc.input = prompt
+      cmd = ["claude", "-p",
+        "--system-prompt-file", systemFile.path,
         "--tools", "",
         "--setting-sources", "",
         "--strict-mcp-config",
@@ -50,6 +57,7 @@ Scope {
     llm.meme = meme || ""
     llm.timedOut = false
     proc.command = cmd
+    proc.stdinEnabled = true
     proc.running = true
     timeout.restart()
     return true
@@ -68,9 +76,24 @@ Scope {
     return { text: text.replace(/^["“]|["”]$/g, ""), meme: "" }
   }
 
+  FileView {
+    id: systemFile
+    path: llm.stateDir + "/" + llm.name + "-system-prompt.txt"
+    blockWrites: true
+    atomicWrites: true
+    printErrors: false
+  }
+
   Process {
     id: proc
+    property string input: ""
     workingDirectory: llm.stateDir
+    // 写完立即关闭 stdin，CLI 读到 EOF 才开始
+    onStarted: {
+      proc.write(proc.input)
+      proc.stdinEnabled = false
+      proc.input = ""
+    }
     environment: ({ AGENT_PET_INTERNAL: "1" })
     stdout: StdioCollector { id: out }
     stderr: StdioCollector { id: err }
