@@ -188,74 +188,18 @@ Scope {
   // ------------------------------------------------------------ 系统通知
   readonly property var notifyTitleKeys: ({ waiting: "notifyWaiting", success: "notifySuccess", error: "notifyError" })
   readonly property var notifyIcons: ({ waiting: "approval", success: "done", error: "error" })
-  // 完整通知（含项目名和消息）经 stdin 交给 bin/agent-pet-notify，由它直接走 D-Bus，不进进程参数。
-  // 没有 PyGObject（gi）时退回 notify-send：它只能从命令行参数拿文本，所以只发固定文字。
-  property bool notifyViaDbus: true
-  property var notifyQueue: []
-
+  // 通知只发 agent 名称和状态等固定文字。Omarchy 的通知服务会把收到的标题和正文
+  // 放进 bash 进程参数里落盘，所以无论怎么发，项目名和消息都不能进通知。
   function notifyFor(entry) {
     if (config.notificationsEnabled === false) return
     var titleKey = notifyTitleKeys[entry.state]
     if (!titleKey) return
-    var title = tr(titleKey)
     var onlyUnfocused = !config.notify || config.notify.onlyWhenUnfocused !== false
     if (onlyUnfocused && entry.focused) return
     var agentName = entry.agent === "codex" ? "Codex" : "Claude Code"
-    var project = WS.projectName(entry.cwd)
-    var n = {
-      app: "agent-pet",
-      icon: root.pluginDir + "/assets/pic/notify-" + notifyIcons[entry.state] + ".png",
-      summary: agentName + (project ? " · " + project : "") + " · " + title,
-      body: entry.message || entry.tool || "",
-      fixedSummary: agentName + " · " + title
-    }
-    if (!notifyViaDbus) {
-      notifyFixed(n)
-      return
-    }
-    notifyQueue = notifyQueue.concat([n])
-    nextNotify()
-  }
-
-  function notifyFixed(n) {
-    Quickshell.execDetached(["notify-send", "-a", n.app, "-i", n.icon, n.fixedSummary])
-  }
-
-  function nextNotify() {
-    while (notifyQueue.length && !notifyProc.running) {
-      var n = notifyQueue[0]
-      notifyQueue = notifyQueue.slice(1)
-      if (!notifyViaDbus) {
-        notifyFixed(n)
-        continue
-      }
-      notifyProc.current = n
-      notifyProc.lastExit = -1
-      notifyProc.stdinEnabled = true
-      notifyProc.running = true
-    }
-  }
-
-  Process {
-    id: notifyProc
-    property var current: null
-    property int lastExit: -1
-    command: [root.pluginDir + "/bin/agent-pet-notify"]
-    onStarted: {
-      write(JSON.stringify(current))
-      stdinEnabled = false
-    }
-    onExited: function(exitCode) {
-      lastExit = exitCode
-    }
-    // 启动失败时只有 runningChanged、没有 exited，所以在这里收尾。
-    // 3 = 没有 gi，-1 = 脚本没能启动：之后都直接发固定文字
-    onRunningChanged: {
-      if (running) return
-      if (lastExit === 3 || lastExit === -1) root.notifyViaDbus = false
-      if (lastExit !== 0) root.notifyFixed(current)
-      root.nextNotify()
-    }
+    Quickshell.execDetached(["notify-send", "-a", "agent-pet",
+      "-i", root.pluginDir + "/assets/pic/notify-" + notifyIcons[entry.state] + ".png",
+      agentName + " · " + tr(titleKey)])
   }
 
   // ------------------------------------------------------------ 用量
