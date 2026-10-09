@@ -76,7 +76,9 @@ Scope {
     }
     config = merged
     ready = true
-    whisperTimer.restart()
+    // restart() 会冲掉 running 绑定，所以按开关显式启停，否则 whisperAuto=false 也会定时碎碎念
+    if (merged.whisperAuto === true) whisperTimer.restart()
+    else whisperTimer.stop()
     usageTimer.restart()
     if (configError) speak("", tr("configError", { error: configError }), "", "error")
   }
